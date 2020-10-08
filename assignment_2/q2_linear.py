@@ -50,7 +50,25 @@ class Linear(DQN):
         ##############################################################
         ################YOUR CODE HERE (6-15 lines) ##################
 
-        pass
+        img_h, img_w, nchan = state_shape
+        self.s = tf.placeholder(dtype = tf.uint8, 
+                                shape = [None, img_h, img_w, nchan * self.config.state_history], 
+                                name = 'state')
+        self.a = tf.placeholder(dtype = tf.int32,
+                                shape = [None,],
+                                name = 'action')
+        self.r = tf.placeholder(dtype = tf.float32,
+                                shape = [None,],
+                                name = 'reward')
+        self.sp = tf.placeholder(dtype = tf.uint8,
+                                 shape = [None, img_h, img_w, nchan * self.config.state_history], 
+                                 name = 'next_state')
+        self.done_mask = tf.placeholder(dtype = tf.bool, 
+                                        shape = [None], 
+                                        name = 'done_mask')
+        self.lr = tf.placeholder(dtype = tf.float32, 
+                                 shape = (), 
+                                 name = 'learning_rate')
 
         ##############################################################
         ######################## END YOUR CODE #######################
@@ -76,7 +94,11 @@ class Linear(DQN):
         """
         TODO: 
             Implement a fully connected with no hidden layer (linear
-            approximation with bias) using tensorflow.
+            approximation with bias) using tensorflow. In other words, if your state s
+            has a flattened shape of n, and you have m actions, the result of 
+            your computation sould be equal to
+                s * W + b where W is a matrix of shape n x m and b is 
+                a vector of size m (you should use bias)
 
         HINT: 
             - You may find the following functions useful:
@@ -88,7 +110,9 @@ class Linear(DQN):
         ##############################################################
         ################ YOUR CODE HERE - 2-3 lines ################## 
         
-        pass
+        flat_state = layers.flatten(state)
+        out = layers.fully_connected(inputs = flat_state, num_outputs = num_actions, 
+                                     activation_fn = None, reuse = reuse, scope = scope)
 
         ##############################################################
         ######################## END YOUR CODE #######################
@@ -132,7 +156,11 @@ class Linear(DQN):
         ##############################################################
         ################### YOUR CODE HERE - 5-10 lines #############
         
-        pass
+        q_set = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope = q_scope)
+        t_q_set = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope = target_q_scope)
+        
+        op = [tf.assign(t_q_set[i], q_set[i]) for i in range(len(q_set))]
+        self.update_target_op = tf.group(*op)
 
         ##############################################################
         ######################## END YOUR CODE #######################
@@ -171,7 +199,11 @@ class Linear(DQN):
         ##############################################################
         ##################### YOUR CODE HERE - 4-5 lines #############
 
-        pass
+        done_flag = 1 - tf.cast(self.done_mask, tf.float32)
+        indices = tf.one_hot(self.a, num_actions)
+        q_samp = self.r + done_flag * self.config.gamma * tf.reduce_max(target_q, axis=1)
+        q_sa = tf.reduce_sum(q * indices, axis=1)
+        self.loss = tf.reduce_mean((q_samp - q_sa) ** 2)
 
         ##############################################################
         ######################## END YOUR CODE #######################
@@ -210,7 +242,14 @@ class Linear(DQN):
         ##############################################################
         #################### YOUR CODE HERE - 8-12 lines #############
 
-        pass
+        optimizer = tf.train.AdamOptimizer(learning_rate=self.lr)
+        scope_variable = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=scope)
+        grads_and_vars = optimizer.compute_gradients(self.loss, scope_variable)
+        if self.config.grad_clip:
+           clipped_grads_and_vars = [(tf.clip_by_norm(item[0],self.config.clip_val),item[1]) 
+                                     for item in grads_and_vars] 
+        self.train_op = optimizer.apply_gradients(clipped_grads_and_vars)
+        self.grad_norm = tf.global_norm([item[0] for item in grads_and_vars])
         
         ##############################################################
         ######################## END YOUR CODE #######################
@@ -227,7 +266,7 @@ if __name__ == '__main__':
     # learning rate schedule
     lr_schedule  = LinearSchedule(config.lr_begin, config.lr_end,
             config.lr_nsteps)
-
+   
     # train model
     model = Linear(env, config)
     model.run(exp_schedule, lr_schedule)
