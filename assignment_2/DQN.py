@@ -21,7 +21,8 @@ seed = 1970
 # The replay buffer contains tuple (state, action, reward, next_state, is_next_state_terminal)
 # The Deepmind paper suggests a max replay length of 1000000 however this causes memory issues. Suggested 100000
 replay = []
-replay_n = 100 # 10**6 # 1 million
+replay_start_n = 100 # 50000 # number of frames in replay memory before learning starts
+replay_max_n = 200   # 10**6 # SGD updates sampled from this number of most recent frames
 
 num_a = 4        # number of actions the agent can execute
 
@@ -30,10 +31,10 @@ epsilon_max = 1
 epsilon_min = 0.1
 anneal_over_n = 1000 # 10**6
 
-max_frames =  10000 # 50 * 10**6  # number of frames to train for (10 million)
-target_update_freq = 100 # 10000 # frame frequency to update target_model with model
+max_frames =  200         # 50*10**6  # number of frames to train for (50 million)
+target_update_freq = 100  # 10000 # frame frequency to update target_model with model
 
-frame_n = 0      # to keep track of number of frames used in training
+
 gamma = 0.99     # discount factor for future rewards
 
 update_freq = 4           # number of frames "played" before an SGD update
@@ -72,8 +73,9 @@ def create_q_model(img_h, img_w, n_chan):
     model.add(Dense(512, activation = 'relu'))
     model.add(Dense(num_a, activation = 'linear'))
     
-    model.compile(optimizer = RMSprop(learning_rate = 0.00025, clipnorm = 1.0), 
-                  loss = 'mse', metrics = ['mse'])
+    optimizer = RMSprop(learning_rate = 0.00025, momentum = 0.95, clipnorm = 1.0)
+    
+    model.compile(optimizer = optimizer, loss = 'mse', metrics = ['mse'])
     
     return model
 
@@ -113,7 +115,7 @@ replay_sp = []
 replay_T = []
       
 s = env.reset()                     # initiating the engagement; intial state of the environment
-for i in range(replay_n):  
+for i in range(replay_start_n):  
     a = np.random.choice(num_a)     # choosing a random action
     sp, r, T, _ = env.step(a)       # take the action and observe sp, r and if_next_state_terminal
     
@@ -140,6 +142,8 @@ target_model = create_q_model(img_h, img_w, n_chan)
 target_model.set_weights(model.get_weights())
 
 #%% Training
+frame_n = 0        # to keep track of number of frames used in training
+episode_reward = 0
 s = env.reset()
 while frame_n < max_frames:
     frame_n += 1
@@ -149,47 +153,51 @@ while frame_n < max_frames:
     if epsilon > np.random.random():
         a = np.random.choice(num_a)
     else:
-        s = tf.convert_to_tensor(s)
-        s = tf.expand_dims(s, 0)  # add an outer 'batch' axis
-        q_hat_a = model(s)        # predict the values for all q(.,a)
-        a = tf.argmax(q_hat_a[0]) # action with max q-value
-        a = K.backend.eval(a)     # extract the action from the tensor
+        s_tensor = tf.convert_to_tensor(s)
+        s_tensor = tf.expand_dims(s_tensor, 0)  # add an outer 'batch' axis
+        q_hat_a = model(s_tensor)               # predict the values for all q(.,a)
+        a = tf.argmax(q_hat_a[0])               # action with max q-value
+        a = K.backend.eval(a)                   # extract the action from the tensor
     
-    # take the action; observe r and sp; append the new tuple to replay
+    # take the action; observe r and sp; append to replay
     sp, r, T, _ = env.step(a)
+    episode_reward += r
     replay_s.append(np.array(s))
     replay_a.append(a)
     replay_r.append(r)
     replay_sp.append(np.array(sp))
     replay_T.append(T)
     
-    # reduce the replay size
-    replay_s.pop(0)
-    replay_a.pop(0)
-    replay_r.pop(0)
-    replay_sp.pop(0)
-    replay_T.pop(0)
+    # should the replay size be trimmed?
+    if len(replay_s) > replay_max_n:
+        replay_s.pop(0)
+        replay_a.pop(0)
+        replay_r.pop(0)
+        replay_sp.pop(0)
+        replay_T.pop(0)
     
     if T:
         s = env.reset()
+        print("episode_reward: ", episode_reward)
+        episode_reward = 0
     else:
         s = sp
     
     # Should we take a SGD gradient step for the model?
     if frame_n % update_freq == 0:
         # sample random minibatch from replay
-        minibatch_i = np.random.choice(np.arange(replay_n), minibatch_size)
-        s_bat = np.array([replay_s[idx] for idx in minibatch_i])
-        a_bat = [replay_a[idx] for idx in minibatch_i]
-        r_bat = [replay_r[idx] for idx in minibatch_i]
-        sp_bat = np.array([replay_sp[idx] for idx in minibatch_i])
-        T_bat = [replay_T[idx] for idx in minibatch_i]
+        minibatch_i = np.random.choice(np.arange(len(replay_s)), minibatch_size)
+        s_bat = np.array([replay_s[i] for i in minibatch_i])
+        a_bat = [replay_a[i] for i in minibatch_i]
+        r_bat = [replay_r[i] for i in minibatch_i]
+        sp_bat = np.array([replay_sp[i] for i in minibatch_i])
+        T_bat = [replay_T[i] for i in minibatch_i]
         
         # predict the q-values for the sp batch using target_model
-        # predict the q-values for the s batch using model
         # identify for each sp record argmax(q(., a))
-        # update q-values for the batch of s and respective a: 
-            # r + gamma * argmax(q-value of sp) if sp is not terminal, else
+        # predict the q-values for the s batch using model
+        # update q-values for the s batch and for the respective action taken: 
+            # r + gamma * max(q-value of sp) if sp is not terminal, else
             # r
         sp_bat = tf.convert_to_tensor(sp_bat)
         q_sp_bat = target_model(sp_bat)
@@ -199,26 +207,19 @@ while frame_n < max_frames:
         q_s_bat = model(s_bat)
         q_s_bat = K.backend.eval(q_s_bat)
         
-        y_hat_bat = q_s_bat.copy()
         for i in range(minibatch_size):
-            a_max = np.argmax(q_sp_bat[0])
             if T_bat[i]:
-                y_hat_bat[i, a_max] = r_bat[i]
+                q_s_bat[i, a_bat[i]] = r_bat[i]
             else:
-                y_hat_bat[i, a_max] = r_bat[i] + gamma * q_sp_bat[i, a_max]
+                q_s_bat[i, a_bat[i]] = r_bat[i] + gamma * np.max(q_sp_bat[i])
                 
         # train the model using the minibatch
-        y_hat_bat = tf.convert_to_tensor(y_hat_bat)
-        model.train_on_batch(s_bat, y_hat_bat)
-        
-        print("Took one step of SGD")
-        
+        q_s_bat = tf.convert_to_tensor(q_s_bat)
+        loss, _ = model.train_on_batch(s_bat, q_s_bat)
+                
     # Should we update target_model with model paramenters
     if frame_n % target_update_freq == 0:
         target_model.set_weights(model.get_weights())
         
         print("Synched the models")
         
-    
-    
-
