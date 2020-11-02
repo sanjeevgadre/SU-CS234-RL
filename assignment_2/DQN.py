@@ -14,6 +14,7 @@ from tensorflow import keras as K
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, Flatten, Dense
 from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.losses import MeanSquaredError as MSE
 
 #%% Helper variables
 seed = 1970
@@ -29,7 +30,7 @@ num_a = 4        # number of actions the agent can execute
 # variables to anneal epsilon
 epsilon_max = 1
 epsilon_min = 0.1
-anneal_over_n = 1000 # 10**6
+anneal_over_n = 10 # 10**6
 
 max_frames =  200         # 50*10**6  # number of frames to train for (50 million)
 target_update_freq = 100  # 10000 # frame frequency to update target_model with model
@@ -73,9 +74,12 @@ def create_q_model(img_h, img_w, n_chan):
     model.add(Dense(512, activation = 'relu'))
     model.add(Dense(num_a, activation = 'linear'))
     
-    optimizer = RMSprop(learning_rate = 0.00025, momentum = 0.95, clipnorm = 1.0)
+    global optimizer_fn
+    global loss_fn 
+    optimizer_fn = RMSprop(learning_rate = 0.00025, momentum = 0.95, clipnorm = 1.0)
+    loss_fn = MSE()
     
-    model.compile(optimizer = optimizer, loss = 'mse', metrics = ['mse'])
+    model.compile(optimizer = optimizer_fn, loss = loss_fn, metrics = ['mse'])
     
     return model
 
@@ -136,6 +140,7 @@ s = env.reset()
 img_h, img_w, n_chan = np.array(s).shape
 
 model = create_q_model(img_h, img_w, n_chan)
+print(model.get_weights())
 target_model = create_q_model(img_h, img_w, n_chan)
 
 # setting the target models weights to be the same as model's
@@ -169,7 +174,7 @@ while frame_n < max_frames:
     replay_T.append(T)
     
     # should the replay size be trimmed?
-    if len(replay_s) > replay_max_n:
+    if frame_n > replay_max_n:
         replay_s.pop(0)
         replay_a.pop(0)
         replay_r.pop(0)
@@ -195,27 +200,33 @@ while frame_n < max_frames:
         
         # predict the q-values for the sp batch using target_model
         # identify for each sp record argmax(q(., a))
-        # predict the q-values for the s batch using model
-        # update q-values for the s batch and for the respective action taken: 
+        # calculate updates q-values for the s batch and for the respective action taken: 
             # r + gamma * max(q-value of sp) if sp is not terminal, else
             # r
         sp_bat = tf.convert_to_tensor(sp_bat)
         q_sp_bat = target_model(sp_bat)
         q_sp_bat = K.backend.eval(q_sp_bat)
-        
-        s_bat = tf.convert_to_tensor(s_bat)
-        q_s_bat = model(s_bat)
-        q_s_bat = K.backend.eval(q_s_bat)
-        
+        updated_q_s_bat = r_bat + gamma * np.max(q_sp_bat, axis = 1)
         for i in range(minibatch_size):
             if T_bat[i]:
-                q_s_bat[i, a_bat[i]] = r_bat[i]
-            else:
-                q_s_bat[i, a_bat[i]] = r_bat[i] + gamma * np.max(q_sp_bat[i])
+                updated_q_s_bat[i] = r_bat[i]
+        
+        updated_q_s_bat = tf.convert_to_tensor(updated_q_s_bat)
                 
-        # train the model using the minibatch
-        q_s_bat = tf.convert_to_tensor(q_s_bat)
-        loss, _ = model.train_on_batch(s_bat, q_s_bat)
+        # predict the q-values for the s batch using model, and 
+        # set masks to extract the q-value for the specific action a taken by the agent
+        s_bat = tf.convert_to_tensor(s_bat)
+        masks = tf.one_hot(a_bat, num_a)
+        
+        # calculate the losses
+        with tf.GradientTape() as tape:
+            q_s_bat = model(s_bat)
+            q_s_bat = tf.reduce_sum(tf.multiply(q_s_bat, masks), axis = 1)
+            loss = loss_fn(updated_q_s_bat, q_s_bat)
+            
+        # backpropogate the loss and take a learning step
+        grads = tape.gradient(loss, model.trainable_variables)
+        optimizer_fn.apply_gradients(zip(grads, model.trainable_variables))
                 
     # Should we update target_model with model paramenters
     if frame_n % target_update_freq == 0:
@@ -223,3 +234,4 @@ while frame_n < max_frames:
         
         print("Synched the models")
         
+print(model.get_weights())
